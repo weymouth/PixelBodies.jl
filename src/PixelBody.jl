@@ -6,40 +6,42 @@ import WaterLily: AbstractBody, measure, measure!, measure_sdf!
 
 A body derived from a pixel image.
 """
-struct PixelBody{A<:AbstractArray{Int,2}} <: AbstractBody
+struct PixelBody{T,A<:AbstractArray{T,2}} <: AbstractBody
     R::CartesianIndices # subarray range
-    mask::A; hold::A # integrated mask
-    function PixelBody(mask::AbstractArray{Bool,2},dims;mem=Array)
+    mask::A; buff::A # integrated mask and ping-pong buffer
+    function PixelBody(mask::AbstractArray{T,2},dims;mem=Array) where T
         n,m = dims .+ 2
         W,H = size(mask)
         W₀,H₀ = min(W,ceil(Int,n/m*H)),min(H,ceil(Int,m/n*W))
         R = CartesianIndices(((W-W₀)÷2+1:(W+W₀)÷2,(H-H₀)÷2+1:(H+H₀)÷2))
-        hold = copy(mask[R]) |> mem .|> Int #copy subarray 
-        mask = cumsum(cumsum(hold,dims=1),dims=2)
-        new{typeof(mask)}(R,mask,hold)
+        buff = mem{T}(undef,size(R)...)
+        a = new{T,typeof(buff)}(R,similar(buff),buff) # uninitialized
+        update!(a,mask); a # initialize
     end
 end
-function update!(a::PixelBody,mask::AbstractArray{Bool,2})
-    copyto!(a.mask,view(mask[a.R]))
-    cumsum!(a.hold,a.mask,dims=1)
-    cumsum!(a.mask,a.hold,dims=2) # ping-pong
+function update!(a::PixelBody{T},mask::AbstractArray{T,2}) where T
+    copyto!(a.mask,CartesianIndices(a.mask),mask,a.R)
+    cumsum!(a.buff,a.mask,dims=1)
+    cumsum!(a.mask,a.buff,dims=2) # ping-pong
 end
 """
     measure!(a::Flow,b::PixelBody)
 
 Measures zeroth-moment μ₀ by integrating the image mask
 """
-function measure!(a::Flow{2,T},b::PixelBody;kwargs...) where T
+function measure!(a::Flow{2,T},b::PixelBody;ϵ=1,kwargs...) where T
     a.V .= zero(T); a.σ .= one(T); a.μ₀ .= one(T); a.μ₁ .= zero(T) # init
 
-    # μ₀ is the volume-fraction of masked pixels within a cell
+    # zeroth-moment is the volume-fraction of masked pixels within a cell
     W,H = size(b.mask); n,m = size(a.σ)
-    for i in 2:n-1, j in 2:m-1
-        I₀,J₀ = clamp(floor(Int,(i-1)*W/n),1,W),clamp(floor(Int,(j-1)*H/m),1,H)
-        I₁,J₁ = clamp(ceil(Int,(i+1)*W/n),1,W),clamp(ceil(Int,(j+1)*H/m),1,H)
+    function vol_frac(ij,mask)
+        i,j = ij.I
+        I₀,J₀ = clamp(floor(Int,(i-ϵ)*W/n),1,W),clamp(floor(Int,(j-ϵ)*H/m),1,H)
+        I₁,J₁ = clamp(ceil(Int,(i+ϵ)*W/n),1,W),clamp(ceil(Int,(j+ϵ)*H/m),1,H)
         dv = T((I₁-I₀)*(J₁-J₀))
-        a.σ[i,j] = (b.mask[I₀,J₀]+b.mask[I₁,J₁]-b.mask[I₀,J₁]-b.mask[I₁,J₀])/dv
+        (mask[I₀,J₀]+mask[I₁,J₁]-mask[I₀,J₁]-mask[I₁,J₀])/dv
     end
+    WaterLily.@loop a.σ[I] = vol_frac(I,b.mask) over I ∈ inside(a.σ,buff=ceil(Int,ϵ))
 
     # Interpolate to faces
     for i ∈ 1:2
